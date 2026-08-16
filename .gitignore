@@ -1,0 +1,21 @@
+# Node.js
+api/node_modules/
+
+# Python
+server/__pycache__/
+server/*.pyc
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Environment — keep only the example template
+api/.env
+
+# Cloned repositories — keep the directory but not its contents
+repos/*
+!repos/.gitkeep
+!repos/.state.json
+
+# State
+.DS_Store
+Thumbs.db
