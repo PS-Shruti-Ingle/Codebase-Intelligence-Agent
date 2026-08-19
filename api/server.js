@@ -20,7 +20,7 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import Anthropic from '@anthropic-ai/sdk';
+import Groq from 'groq-sdk';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = dirname(__filename);
@@ -39,11 +39,11 @@ app.use(express.static(join(__dirname, '../gui')));
 /** @type {Client|null} */
 let mcpClient = null;
 
-/** @type {Anthropic|null} */
-let anthropic = null;
+/** @type {Groq|null} */
+let groq = null;
 
 /**
- * MCP tools converted to Anthropic tool format.
+ * MCP tools converted to Groq/OpenAI tool format.
  * @type {Array<{name:string, description:string, input_schema:object}>}
  */
 let mcpTools = [];
@@ -66,13 +66,13 @@ const STATUS_INTERVAL_MS = 30_000;
 async function initMCP() {
   console.log('[MCP] Initialising…');
 
-  // Anthropic client
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  // Groq client
+  const apiKey = process.env.GROQ_API_KEY;
   if (apiKey) {
-    anthropic = new Anthropic({ apiKey });
-    console.log('[AI] Anthropic client ready.');
+    groq = new Groq({ apiKey });
+    console.log('[AI] Groq client ready.');
   } else {
-    console.warn('[AI] ANTHROPIC_API_KEY not set — AI Q&A will be unavailable.');
+    console.warn('[AI] GROQ_API_KEY not set — AI Q&A will be unavailable.');
   }
 
   // Spawn the Python MCP server
@@ -94,9 +94,12 @@ async function initMCP() {
   // Load tools once — re-used by every request
   const { tools } = await mcpClient.listTools();
   mcpTools = tools.map(t => ({
-    name: t.name,
-    description: t.description ?? '',
-    input_schema: t.inputSchema ?? { type: 'object', properties: {} },
+    type: 'function',
+    function: {
+      name: t.name,
+      description: t.description ?? '',
+      parameters: t.inputSchema ?? { type: 'object', properties: {} },
+    }
   }));
 
   console.log(`[MCP] Loaded ${mcpTools.length} tools: ${mcpTools.map(t => t.name).join(', ')}`);
@@ -125,13 +128,14 @@ You have MCP tools that let you search, read, and analyse any file in the repo.
 
 Rules:
 1. ALWAYS use tools to gather real evidence BEFORE answering. Never answer from memory.
-2. Start with search_code or find_references to locate relevant code.
-3. Use read_file to inspect actual implementations — cite file paths and line numbers.
-4. Use trace_execution to understand call chains when asked about flow or behaviour.
-5. Combine multiple tools if needed. The quality of your answer depends on real evidence.
-6. If you cannot find evidence after exhausting tools, say so honestly — do NOT guess.
-7. Format code references as [path/to/file.py:42] or [path/to/file.py:10-25].
-8. Write concise, developer-focused answers with code snippets where helpful.`;
+2. Use a systematic reasoning process internally: Think about what to do, Act by calling a tool, Observe the result, and Decide the next step.
+3. Start with search_code or find_references to locate relevant code.
+4. Use read_file to inspect actual implementations — cite file paths and line numbers.
+5. Use trace_execution to understand call chains when asked about flow or behaviour.
+6. Combine multiple tools if needed. The quality of your answer depends on real evidence.
+7. If you cannot find evidence after exhausting tools, say so honestly — do NOT guess.
+8. Format code references as [path/to/file.py:42].
+9. Write concise, developer-focused final answers. Do NOT expose your internal chain-of-thought or reasoning process to the user in the final output.`;
 
 /**
  * Run an agentic Claude loop: Claude calls MCP tools until it can answer.
@@ -139,54 +143,93 @@ Rules:
  * @returns {Promise<string>} Final text answer
  */
 async function agenticAnswer(question) {
-  if (!anthropic) throw new Error('ANTHROPIC_API_KEY is not configured.');
+  if (!groq) throw new Error('GROQ_API_KEY is not configured.');
   if (!mcpClient) throw new Error('MCP client not connected.');
 
-  const messages = [{ role: 'user', content: question }];
+  const messages = [
+    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'user', content: question }
+  ];
   const MAX_ITERS = 12;
+  
+  let initialAnswer = '';
 
   for (let iter = 0; iter < MAX_ITERS; iter++) {
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-5',
+    const response = await groq.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
       max_tokens: 8192,
-      system: SYSTEM_PROMPT,
-      tools: mcpTools,
       messages,
+      tools: mcpTools,
+      tool_choice: 'auto'
     });
 
-    if (response.stop_reason === 'end_turn') {
-      return response.content
-        .filter(b => b.type === 'text')
-        .map(b => b.text)
-        .join('\n');
-    }
+    const message = response.choices[0].message;
 
-    if (response.stop_reason === 'tool_use') {
-      const toolUses = response.content.filter(b => b.type === 'tool_use');
-      messages.push({ role: 'assistant', content: response.content });
+    if (message.tool_calls) {
+      messages.push(message);
 
       const toolResults = await Promise.all(
-        toolUses.map(async tu => {
+        message.tool_calls.map(async tu => {
           let content;
           try {
-            const result = await mcpClient.callTool({ name: tu.name, arguments: tu.input });
+            const args = JSON.parse(tu.function.arguments);
+            const result = await mcpClient.callTool({ name: tu.function.name, arguments: args });
             content = extractText(result);
           } catch (err) {
-            content = JSON.stringify({ error: err.message });
+            content = JSON.stringify({ success: false, error_type: 'tool_failure', message: err.message });
           }
-          return { type: 'tool_result', tool_use_id: tu.id, content };
+          return { role: 'tool', tool_call_id: tu.id, name: tu.function.name, content };
         })
       );
 
-      messages.push({ role: 'user', content: toolResults });
+      messages.push(...toolResults);
       continue;
     }
 
-    // Unexpected stop — return whatever text we have
+    initialAnswer = message.content || '';
     break;
   }
 
-  return 'Analysis complete — maximum tool-call depth reached.';
+  if (!initialAnswer) {
+    initialAnswer = 'Analysis complete — maximum tool-call depth reached.';
+  }
+  
+  return await reflectOnAnswer(question, initialAnswer, messages);
+}
+
+/**
+ * One-shot reflection pass to verify the initial answer.
+ */
+async function reflectOnAnswer(question, initialAnswer, contextMessages) {
+  if (!groq) return initialAnswer;
+
+  const reflectionPrompt = `You are a reflection agent.
+A user asked: "${question}"
+An initial agent provided this answer based on tool data:
+---
+${initialAnswer}
+---
+
+Your task: Evaluate if this answer is correct, supported by the data, and directly answers the question.
+If it's already good, confirm it by outputting the exact original answer or a slightly polished version.
+If it's missing important details, incorrect because of an API failure, or unsupported, correct it.
+Do NOT output recursive reflection loops. Do NOT expose internal reasoning. Just output the final, corrected or confirmed answer.`;
+
+  try {
+    const response = await groq.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
+      max_tokens: 4096,
+      messages: [
+        { role: 'system', content: reflectionPrompt },
+        { role: 'user', content: "Please evaluate and return the final answer." }
+      ]
+    });
+    
+    return response.choices[0].message.content;
+  } catch (err) {
+    console.error('[Reflection Error]', err.message);
+    return initialAnswer;
+  }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -214,7 +257,7 @@ app.get('/api/health', (_req, res) => {
   res.json({
     status: 'ok',
     mcpConnected: !!mcpClient,
-    aiEnabled: !!anthropic,
+    aiEnabled: !!groq,
     toolCount: mcpTools.length,
     promptCount: mcpPrompts.length,
     timestamp: new Date().toISOString(),
@@ -225,8 +268,8 @@ app.get('/api/health', (_req, res) => {
 app.post('/api/config', (req, res) => {
   const { apiKey } = req.body ?? {};
   if (!apiKey) return res.status(400).json({ error: 'apiKey required' });
-  anthropic = new Anthropic({ apiKey });
-  res.json({ status: 'ok', message: 'Anthropic API key accepted.' });
+  groq = new Groq({ apiKey });
+  res.json({ status: 'ok', message: 'Groq API key accepted.' });
 });
 
 // Clone repository

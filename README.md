@@ -8,15 +8,16 @@ An **MCP-powered AI workspace** for exploring and understanding any public GitHu
 GUI (browser)
   └─► Express API (Node.js)
         ├─► MCP Client  ──►  Python MCP Server
-        │                       ├─► Tools (9): search_code, read_file, get_repo_structure,
+        │                       ├─► Tools (11): clone_repository, search_code, read_file, get_repo_structure,
         │                       │             find_references, trace_execution,
         │                       │             check_repo_status, sync_repository,
-        │                       │             build_relationship_graph, semantic_search
+        │                       │             build_relationship_graph, semantic_search,
+        │                       │             fetch_github_repo_info
         │                       ├─► Resources: repo://structure, repo://readme,
         │                       │             repo://metadata, repo://git_status
         │                       └─► Prompts:  architecture_analysis, execution_flow,
         │                                     code_review, module_explanation
-        └─► Anthropic Claude (agentic Q&A loop)
+        └─► Groq Llama (ReAct Q&A loop + One-Shot Reflection)
 ```
 
 ## Prerequisites
@@ -26,7 +27,7 @@ GUI (browser)
 | Python | 3.10+ |
 | Node.js | 18+ |
 | Git | any recent |
-| Anthropic API Key | Required for AI Q&A |
+| Groq API Key | Required for AI Q&A |
 
 ## Quick Start (Windows)
 
@@ -52,7 +53,7 @@ npm install
 
 # Configure API key
 cp .env.example .env
-# Edit .env: set ANTHROPIC_API_KEY=sk-ant-...
+# Edit .env: set GROQ_API_KEY=gsk-...
 
 # Start
 node server.js

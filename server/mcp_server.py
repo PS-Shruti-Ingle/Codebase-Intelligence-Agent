@@ -13,6 +13,8 @@ Prompts    : architecture_analysis, execution_flow, code_review, module_explanat
 
 import json
 import sys
+import urllib.request
+import urllib.error
 from pathlib import Path
 from typing import Optional, Dict
 
@@ -416,6 +418,48 @@ def semantic_search(query: str) -> str:
     engine = _get_retrieval(repo)
     results = engine.semantic_search(query)
     return json.dumps({"query": query, "results": results, "total": len(results)}, indent=2)
+
+
+@mcp.tool()
+def fetch_github_repo_info(owner: str, repo: str) -> str:
+    """
+    Fetch basic repository metadata (stars, forks, open issues) from the public GitHub API.
+    Demonstrates using a free public API and robust HTTP error handling.
+    """
+    url = f"https://api.github.com/repos/{owner}/{repo}"
+    req = urllib.request.Request(url, headers={'User-Agent': 'CodebaseIntelligenceAgent'})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode())
+            return json.dumps({
+                "success": True,
+                "owner": owner,
+                "repo": repo,
+                "stars": data.get("stargazers_count"),
+                "forks": data.get("forks_count"),
+                "open_issues": data.get("open_issues_count"),
+                "description": data.get("description")
+            }, indent=2)
+    except urllib.error.HTTPError as e:
+        error_type = "not_found" if e.code == 404 else "rate_limit" if e.code == 403 else "http_error"
+        return json.dumps({
+            "success": False,
+            "error_type": error_type,
+            "code": e.code,
+            "message": e.reason
+        })
+    except urllib.error.URLError as e:
+        return json.dumps({
+            "success": False,
+            "error_type": "network_error",
+            "message": str(e.reason)
+        })
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "error_type": "unknown_error",
+            "message": str(e)
+        })
 
 
 # ===========================================================================

@@ -37,7 +37,7 @@ REM ── Create .env if it doesn't exist ────────────�
 if not exist "api\.env" (
     echo [INFO] Creating api\.env from template…
     copy "api\.env.example" "api\.env" >nul
-    echo [WARN] Please edit api\.env and add your ANTHROPIC_API_KEY.
+    echo [WARN] Please edit api\.env and add your GROQ_API_KEY.
     echo        Or set it via the "API Key" button in the UI.
     echo.
 )
