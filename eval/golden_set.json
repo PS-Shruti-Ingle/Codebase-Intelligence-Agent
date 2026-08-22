@@ -1,0 +1,142 @@
+[
+  {
+    "id": "q001",
+    "question": "What is the main entry point of this project?",
+    "expected_keywords": ["server", "main", "entry", "start", "app"],
+    "expected_has_citation": true,
+    "category": "navigation"
+  },
+  {
+    "id": "q002",
+    "question": "What is the overall architecture of this codebase?",
+    "expected_keywords": ["component", "layer", "module", "service", "architecture"],
+    "expected_has_citation": true,
+    "category": "architecture"
+  },
+  {
+    "id": "q003",
+    "question": "What languages and frameworks does this project use?",
+    "expected_keywords": [],
+    "expected_has_citation": false,
+    "category": "metadata"
+  },
+  {
+    "id": "q004",
+    "question": "How are dependencies managed in this project?",
+    "expected_keywords": ["package", "requirements", "dependencies", "install"],
+    "expected_has_citation": true,
+    "category": "tooling"
+  },
+  {
+    "id": "q005",
+    "question": "What tests exist in this codebase?",
+    "expected_keywords": ["test", "spec", "assert", "unittest", "pytest", "jest", "mocha"],
+    "expected_has_citation": false,
+    "category": "testing"
+  },
+  {
+    "id": "q006",
+    "question": "How is configuration managed (environment variables, config files)?",
+    "expected_keywords": ["config", "env", "environment", "setting"],
+    "expected_has_citation": true,
+    "category": "configuration"
+  },
+  {
+    "id": "q007",
+    "question": "Describe the data flow from a user request to a response.",
+    "expected_keywords": ["request", "response", "handler", "route", "controller"],
+    "expected_has_citation": true,
+    "category": "flow"
+  },
+  {
+    "id": "q008",
+    "question": "What external APIs or services does this project call?",
+    "expected_keywords": [],
+    "expected_has_citation": false,
+    "category": "integrations"
+  },
+  {
+    "id": "q009",
+    "question": "Where is error handling implemented?",
+    "expected_keywords": ["error", "exception", "try", "catch", "except", "handle"],
+    "expected_has_citation": true,
+    "category": "error_handling"
+  },
+  {
+    "id": "q010",
+    "question": "How would a developer set up and run this project locally?",
+    "expected_keywords": ["install", "run", "start", "setup", "command"],
+    "expected_has_citation": false,
+    "category": "onboarding"
+  },
+  {
+    "id": "q011",
+    "question": "What is the purpose of the most important file in this repository?",
+    "expected_keywords": [],
+    "expected_has_citation": true,
+    "category": "navigation"
+  },
+  {
+    "id": "q012",
+    "question": "Explain how data is stored or persisted in this project.",
+    "expected_keywords": ["store", "persist", "save", "database", "file", "cache"],
+    "expected_has_citation": true,
+    "category": "data"
+  },
+  {
+    "id": "q013",
+    "question": "Are there any security mechanisms implemented (auth, input validation, etc.)?",
+    "expected_keywords": ["auth", "validate", "sanitize", "secure", "permission"],
+    "expected_has_citation": true,
+    "category": "security"
+  },
+  {
+    "id": "q014",
+    "question": "What does the README say about this project?",
+    "expected_keywords": [],
+    "expected_has_citation": false,
+    "category": "documentation"
+  },
+  {
+    "id": "q015",
+    "question": "What are the most recently changed files and why were they changed?",
+    "expected_keywords": [],
+    "expected_has_citation": false,
+    "category": "git_history"
+  },
+  {
+    "id": "q016",
+    "question": "Which module or file is imported or used most frequently?",
+    "expected_keywords": ["import", "require", "use", "call"],
+    "expected_has_citation": true,
+    "category": "structure"
+  },
+  {
+    "id": "q017",
+    "question": "How is logging implemented in this project?",
+    "expected_keywords": ["log", "logger", "print", "console", "debug", "info", "warn"],
+    "expected_has_citation": true,
+    "category": "observability"
+  },
+  {
+    "id": "q018",
+    "question": "What are the main classes or types defined in this project?",
+    "expected_keywords": ["class", "type", "interface", "struct", "model"],
+    "expected_has_citation": true,
+    "category": "structure"
+  },
+  {
+    "id": "q019",
+    "question": "Is there a Dockerfile or containerization setup?",
+    "expected_keywords": ["docker", "container", "image", "compose"],
+    "expected_has_citation": false,
+    "category": "infrastructure"
+  },
+  {
+    "id": "q020",
+    "question": "Where should I start reading to understand the project's core logic?",
+    "expected_keywords": [],
+    "expected_has_citation": true,
+    "category": "onboarding"
+  }
+]

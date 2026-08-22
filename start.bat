@@ -6,6 +6,9 @@ echo   Codebase Intelligence Agent — Launcher
 echo ================================================
 echo.
 
+REM ── Change to script directory ───────────────────────────
+cd /d "%~dp0"
+
 REM ── Check Python ──────────────────────────────────────────
 python --version >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
@@ -38,7 +41,6 @@ if not exist "api\.env" (
     echo [INFO] Creating api\.env from template…
     copy "api\.env.example" "api\.env" >nul
     echo [WARN] Please edit api\.env and add your GROQ_API_KEY.
-    echo        Or set it via the "API Key" button in the UI.
     echo.
 )
 
