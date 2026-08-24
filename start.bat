@@ -27,11 +27,24 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
-REM ── Check Git ─────────────────────────────────────────────
+REM ── Auto-detect Git in common paths ─────────────────────────
+if exist "%LOCALAPPDATA%\Programs\Git\cmd\git.exe" set "PATH=%LOCALAPPDATA%\Programs\Git\cmd;%PATH%"
+if exist "%LOCALAPPDATA%\Programs\Git\bin\git.exe" set "PATH=%LOCALAPPDATA%\Programs\Git\bin;%PATH%"
+if exist "C:\Program Files\Git\cmd\git.exe" set "PATH=C:\Program Files\Git\cmd;%PATH%"
+if exist "C:\Program Files (x86)\Git\cmd\git.exe" set "PATH=C:\Program Files (x86)\Git\cmd;%PATH%"
+
+REM ── Check Git (and auto-download portable Git if missing) ─────
 git --version >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
-    echo [ERROR] Git is not installed or not in PATH.
-    echo         Install Git from https://git-scm.com
+    echo [INFO] Git not found. Downloading and configuring portable Git...
+    python -c "import urllib.request, zipfile, os; zip_p = os.path.join(os.environ['TEMP'], 'mingit.zip'); dest = os.path.expandvars(r'%%LOCALAPPDATA%%\Programs\Git'); urllib.request.urlretrieve('https://github.com/git-for-windows/git/releases/download/v2.45.2.windows.1/MinGit-2.45.2-64-bit.zip', zip_p); os.makedirs(dest, exist_ok=True); zipfile.ZipFile(zip_p).extractall(dest); os.remove(zip_p)"
+    if exist "%LOCALAPPDATA%\Programs\Git\cmd\git.exe" set "PATH=%LOCALAPPDATA%\Programs\Git\cmd;%PATH%"
+)
+
+git --version >nul 2>&1
+if %ERRORLEVEL% NEQ 0 (
+    echo [ERROR] Git could not be configured automatically.
+    echo         Please install Git from https://git-scm.com
     pause
     exit /b 1
 )
@@ -40,7 +53,7 @@ REM ── Create .env if it doesn't exist ────────────�
 if not exist "api\.env" (
     echo [INFO] Creating api\.env from template…
     copy "api\.env.example" "api\.env" >nul
-    echo [WARN] Please edit api\.env and add your GROQ_API_KEY.
+    echo [WARN] Please edit api\.env and add your GEMINI_API_KEY.
     echo.
 )
 

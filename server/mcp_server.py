@@ -40,7 +40,26 @@ except ImportError:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "mcp", "-q"])
         from mcp.server.mcpserver import MCPServer as FastMCP
 
-# ── gitpython ────────────────────────────────────────────────────────────────
+# ── gitpython auto-discovery ────────────────────────────────────────────────
+import os
+os.environ["GIT_PYTHON_REFRESH"] = "quiet"
+if sys.platform == "win32":
+    _common_git_paths = [
+        Path(os.path.expandvars(r"%LOCALAPPDATA%\Programs\Git\cmd")),
+        Path(os.path.expandvars(r"%LOCALAPPDATA%\Programs\Git\bin")),
+        Path(r"C:\Program Files\Git\cmd"),
+        Path(r"C:\Program Files\Git\bin"),
+        Path(r"C:\Program Files (x86)\Git\cmd"),
+        Path(r"C:\Program Files (x86)\Git\bin"),
+    ]
+    for _p in _common_git_paths:
+        _git_exe = _p / "git.exe"
+        if _git_exe.exists():
+            os.environ["GIT_PYTHON_GIT_EXECUTABLE"] = str(_git_exe)
+            if str(_p) not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = f"{_p};" + os.environ.get("PATH", "")
+            break
+
 try:
     import git
 except ImportError:
@@ -58,6 +77,39 @@ _doc_cache: Dict[str, str]                  = {}   # cache_key -> documentation 
 _component_graph_cache: Dict[str, dict]     = {}   # cache_key -> graph dict
 
 
+def _canonical_repo_id(url: str) -> str:
+    """
+    Normalizes any GitHub repository URL to a canonical identifier: 'owner/repo'.
+    Handles trailing slashes, .git extensions, SSH URLs, HTTPS URLs, and sub-paths.
+    """
+    if not url:
+        return ""
+    import re
+    u = url.strip()
+    u = re.sub(r'^(git\+https?://|git\+ssh://|git@)', 'https://', u)
+    u = re.sub(r'^https?://github\.com:', 'https://github.com/', u)
+    u = re.sub(r'https?://[^@]+@github\.com/', 'https://github.com/', u)
+    u = u.rstrip('/')
+    if u.endswith('.git'):
+        u = u[:-4]
+    match = re.search(r'github\.com/([^/]+)/([^/]+)', u, re.IGNORECASE)
+    if match:
+        owner = match.group(1).lower().strip()
+        repo = match.group(2).lower().strip()
+        return f"{owner}/{repo}"
+    parts = [p for p in u.rstrip('/').split('/') if p]
+    if len(parts) >= 2:
+        return f"{parts[-2].lower().strip()}/{parts[-1].lower().strip()}"
+    return u.lower().strip()
+
+
+def _workspace_id_for(canonical_id: str) -> str:
+    """Derive a stable, unique workspace ID from canonical repo ID."""
+    if not canonical_id:
+        return "ws_default"
+    return f"ws_{hashlib.sha256(canonical_id.encode('utf-8')).hexdigest()[:12]}"
+
+
 def _get_analyzer(repo: Path) -> CodeAnalyzer:
     key = str(repo.resolve())
     if key not in _analyzer_cache:
@@ -70,6 +122,14 @@ def _get_retrieval(repo: Path) -> RetrievalEngine:
     if key not in _retrieval_cache:
         _retrieval_cache[key] = RetrievalEngine(key)
     return _retrieval_cache[key]
+
+
+def _invalidate_all_caches():
+    """Wipe all repository analyzers, retrieval indexes, doc caches, and component graphs."""
+    _analyzer_cache.clear()
+    _retrieval_cache.clear()
+    _doc_cache.clear()
+    _component_graph_cache.clear()
 
 
 def _invalidate_cache(repo: Path):
@@ -98,6 +158,28 @@ def _repo_cache_key(repo: Path) -> str:
 
 # Persistent state file – survives server restarts
 _STATE_FILE = _HERE.parent / "repos" / ".state.json"
+_SESSION_ROOT = (_HERE.parent / "repos" / ".sessions").resolve()
+
+
+def _remove_session_repo(repo: Optional[Path]) -> bool:
+    if not repo:
+        return False
+    try:
+        resolved = repo.resolve()
+        if resolved == _SESSION_ROOT or _SESSION_ROOT not in resolved.parents:
+            return False
+        import os
+        import shutil
+        def _onerror(func, path, _exc):
+            try:
+                os.chmod(path, 0o700)
+                func(path)
+            except Exception:
+                pass
+        shutil.rmtree(resolved, onerror=_onerror)
+        return not resolved.exists()
+    except Exception:
+        return False
 
 
 # ===========================================================================
@@ -111,7 +193,14 @@ def _load_state() -> dict:
             return json.loads(_STATE_FILE.read_text())
         except Exception:
             pass
-    return {"repo_path": None, "repo_url": None, "branch": None}
+    return {
+        "repo_path": None,
+        "repo_url": None,
+        "canonical_id": None,
+        "workspace_id": None,
+        "branch": None,
+        "commit_sha": None,
+    }
 
 
 def _save_state(state: dict):
@@ -165,56 +254,96 @@ def _github_request(url: str, token: Optional[str] = None) -> dict:
 def clone_repository(url: str, branch: str = "") -> str:
     """
     Clone a public GitHub repository to local storage.
-    Returns JSON with status, repo_path, repo_name, resolved_branch, and branches list.
+    Returns JSON with status, repo_path, repo_name, canonical_id, workspace_id, resolved_branch, branches list, and is_switch.
     branch is optional — leave empty to use the repository default branch.
     """
     # Input validation
     url = url.strip()
-    if not url.startswith(("https://github.com/", "http://github.com/", "git@github.com:")):
-        # Accept any git URL but warn if it looks wrong
-        if "github.com" not in url and not url.endswith(".git"):
-            return json.dumps({
-                "status": "error",
-                "message": "Please provide a valid public GitHub repository URL (e.g., https://github.com/owner/repo)"
-            })
+    if not url:
+        return json.dumps({
+            "status": "error",
+            "message": "Please provide a valid public GitHub repository URL."
+        })
 
-    repos_dir = _HERE.parent / "repos"
-    repos_dir.mkdir(parents=True, exist_ok=True)
+    target_canonical = _canonical_repo_id(url)
+    if not target_canonical or ("github.com" not in url and not url.endswith(".git") and "/" not in target_canonical):
+        return json.dumps({
+            "status": "error",
+            "message": "Please provide a valid public GitHub repository URL (e.g., https://github.com/owner/repo)"
+        })
 
-    # Derive a safe directory name — sanitize to alphanumeric + dash/underscore
-    import re
-    raw_name = url.rstrip("/").split("/")[-1].removesuffix(".git")
-    repo_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", raw_name)[:80]
-    repo_path = repos_dir / repo_name
+    target_workspace_id = _workspace_id_for(target_canonical)
+    previous_state = _load_state()
+    previous_url = previous_state.get("repo_url") or ""
+    previous_canonical = _canonical_repo_id(previous_url)
+    previous_repo = _current_repo()
 
-    # If already cloned with same remote, just update state
-    if repo_path.exists():
+    is_same_repo = (
+        previous_canonical == target_canonical
+        and previous_repo is not None
+        and previous_repo.exists()
+    )
+
+    if is_same_repo:
         try:
-            existing = git.Repo(repo_path)
-            remote_url = existing.remotes.origin.url.rstrip("/").removesuffix(".git")
-            target_url = url.rstrip("/").removesuffix(".git")
-            if remote_url == target_url:
-                resolved_branch = existing.active_branch.name
-                branches = _list_branches(existing)
-                _save_state({
-                    "repo_path": str(repo_path),
-                    "repo_url": url,
-                    "branch": resolved_branch,
-                    "commit_sha": existing.head.commit.hexsha,
-                })
-                return json.dumps({
-                    "status": "already_exists",
-                    "message": f"Repository already cloned at {repo_path}",
-                    "repo_path": str(repo_path),
-                    "repo_name": repo_name,
-                    "resolved_branch": resolved_branch,
-                    "branches": branches,
-                })
+            existing = git.Repo(previous_repo)
+            if branch and branch not in ("", "main", "master", "default") and existing.active_branch.name != branch:
+                try:
+                    existing.git.checkout(branch)
+                except Exception:
+                    pass
+            resolved_branch = existing.active_branch.name
+            branches = _list_branches(existing)
+            commit_sha = existing.head.commit.hexsha
+            _save_state({
+                "repo_path": str(previous_repo),
+                "repo_url": url,
+                "canonical_id": target_canonical,
+                "workspace_id": target_workspace_id,
+                "branch": resolved_branch,
+                "commit_sha": commit_sha,
+            })
+            return json.dumps({
+                "status": "already_exists",
+                "is_switch": False,
+                "message": f"Repository already cloned at {previous_repo}",
+                "repo_path": str(previous_repo),
+                "repo_name": target_canonical.split("/")[-1],
+                "canonical_id": target_canonical,
+                "workspace_id": target_workspace_id,
+                "resolved_branch": resolved_branch,
+                "branches": branches,
+                "commit_sha": commit_sha[:7] if commit_sha else "",
+            })
         except Exception:
             pass
-        # Different repo — suffix to avoid collision
-        import time
-        repo_path = repos_dir / f"{repo_name}_{int(time.time())}"
+
+    # GENUINE REPOSITORY SWITCH OR INITIAL LOAD — ATOMIC CLEANUP
+    _invalidate_all_caches()
+
+    if previous_repo:
+        _remove_session_repo(previous_repo)
+
+    if _SESSION_ROOT.exists():
+        import os
+        import shutil
+        def _onerror(func, path, _exc):
+            try:
+                os.chmod(path, 0o700)
+                func(path)
+            except Exception:
+                pass
+        for child in _SESSION_ROOT.iterdir():
+            if child.is_dir() and _SESSION_ROOT in child.resolve().parents:
+                shutil.rmtree(child, onerror=_onerror)
+
+    repos_dir = _SESSION_ROOT
+    repos_dir.mkdir(parents=True, exist_ok=True)
+
+    import re
+    raw_name = target_canonical.split("/")[-1]
+    repo_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", raw_name)[:80]
+    repo_path = repos_dir / repo_name
 
     # Attempt clone
     clone_kwargs: dict = {}
@@ -260,20 +389,56 @@ def clone_repository(url: str, branch: str = "") -> str:
     _save_state({
         "repo_path": str(repo_path),
         "repo_url": url,
+        "canonical_id": target_canonical,
+        "workspace_id": target_workspace_id,
         "branch": resolved_branch,
         "commit_sha": commit_sha,
     })
-    _invalidate_cache(repo_path)
 
     return json.dumps({
         "status": "success",
-        "message": "Repository cloned successfully",
+        "is_switch": True,
+        "message": "Repository cloned successfully into fresh workspace",
         "repo_path": str(repo_path),
         "repo_name": repo_name,
+        "canonical_id": target_canonical,
+        "workspace_id": target_workspace_id,
         "resolved_branch": resolved_branch,
         "branches": branches,
         "commit_sha": commit_sha[:7] if commit_sha else "",
     })
+
+
+@mcp.tool()
+def cleanup_repository() -> str:
+    """Delete the active temporary repository, clear session state, and invalidate all caches."""
+    _invalidate_all_caches()
+    state = _load_state()
+    repo = _current_repo()
+    removed = _remove_session_repo(repo)
+    if _SESSION_ROOT.exists():
+        import os
+        import shutil
+        def _onerror(func, path, _exc):
+            try:
+                os.chmod(path, 0o700)
+                func(path)
+            except Exception:
+                pass
+        for child in _SESSION_ROOT.iterdir():
+            if child.is_dir() and _SESSION_ROOT in child.resolve().parents:
+                shutil.rmtree(child, onerror=_onerror)
+        removed = removed or not any(_SESSION_ROOT.iterdir())
+    state.update({
+        "repo_path": None,
+        "repo_url": None,
+        "canonical_id": None,
+        "workspace_id": None,
+        "branch": None,
+        "commit_sha": None
+    })
+    _save_state(state)
+    return json.dumps({"status": "cleaned", "removed": removed})
 
 
 def _list_branches(repo: git.Repo) -> List[str]:
@@ -551,11 +716,9 @@ def build_relationship_graph() -> str:
 @mcp.tool()
 def build_component_graph() -> str:
     """
-    Build a COARSE-GRAINED component-level architecture graph.
-    Unlike build_relationship_graph, this shows major systems/modules only —
-    not individual functions. Suitable for high-level architecture visualization.
-    Nodes represent: frontend, backend, API layer, services, databases,
-    external APIs, authentication, major modules.
+    Build a comprehensive component-level architecture graph of the codebase.
+    Visualizes layers: UI / Frontend, Key Components, Services, State / Context,
+    Backend / APIs, Database, and External AI & Cloud Integrations.
     """
     repo = _current_repo()
     if not repo:
@@ -573,42 +736,77 @@ def build_component_graph() -> str:
     edges = []
     node_id = [0]
 
-    def new_id(label: str) -> str:
+    def new_id(prefix: str = "comp") -> str:
         node_id[0] += 1
-        return f"comp_{node_id[0]}"
+        return f"{prefix}_{node_id[0]}"
 
     added: Dict[str, str] = {}  # label -> id
 
-    def add_node(label: str, node_type: str, description: str = "") -> str:
+    def add_node(label: str, node_type: str, description: str = "", path: str = "") -> str:
         if label in added:
             return added[label]
-        nid = new_id(label)
+        nid = new_id(node_type)
         added[label] = nid
-        nodes.append({"id": nid, "label": label, "type": node_type, "description": description})
+        node_obj = {"id": nid, "label": label, "type": node_type, "description": description}
+        if path:
+            node_obj["path"] = path
+        nodes.append(node_obj)
         return nid
 
     def add_edge(src: str, tgt: str, rel: str):
         if src and tgt and src != tgt:
             edges.append({"source": src, "target": tgt, "type": rel})
 
-    # Map repo structure to component types
+    # 1. Entry actor
+    user_node = add_node("User / Client", "ui", "End-user interaction / Web browser")
+
+    # 2. Main Entry Points
+    entry_nodes = []
+    for ep in metadata.get("entry_points", []):
+        ep_name = Path(ep).name
+        nid = add_node(ep_name, "ui" if ep_name.endswith((".tsx", ".jsx", ".html")) else "service", f"Main entry point ({ep})", ep)
+        entry_nodes.append(nid)
+        add_edge(user_node, nid, "accesses")
+
+    # If no entry points detected, look for standard entry files
+    if not entry_nodes:
+        for fname in ["App.tsx", "App.jsx", "main.tsx", "index.html", "index.js", "app.py", "main.py", "server.js", "server.ts"]:
+            p = repo / fname
+            if p.exists():
+                nid = add_node(fname, "ui" if fname.endswith((".tsx", ".jsx", ".html")) else "service", f"Entry file ({fname})", fname)
+                entry_nodes.append(nid)
+                add_edge(user_node, nid, "accesses")
+                break
+
+    # 3. Scan Directories & map to architecture layers
     _dir_component_map = {
-        "frontend": ("Frontend", "ui"),
+        "components": ("UI Components", "ui"),
+        "frontend": ("Frontend App", "ui"),
         "ui": ("UI Layer", "ui"),
-        "client": ("Client", "ui"),
-        "web": ("Web Layer", "ui"),
-        "gui": ("GUI", "ui"),
+        "client": ("Client Layer", "ui"),
+        "web": ("Web Interface", "ui"),
+        "gui": ("GUI Layer", "ui"),
+        "pages": ("Page Views", "ui"),
+        "views": ("Views", "ui"),
+        "screens": ("Screens", "ui"),
         "public": ("Static Assets", "ui"),
         "static": ("Static Assets", "ui"),
 
-        "backend": ("Backend", "service"),
-        "api": ("API Layer", "api"),
-        "server": ("Server", "service"),
-        "app": ("Application Core", "service"),
-        "src": ("Source", "service"),
+        "hooks": ("State Hooks", "middleware"),
+        "context": ("Application Context", "middleware"),
+        "contexts": ("Application Context", "middleware"),
+        "store": ("State Store", "middleware"),
+        "stores": ("State Store", "middleware"),
+        "state": ("State Management", "middleware"),
 
-        "services": ("Services", "service"),
-        "service": ("Services", "service"),
+        "services": ("Service Layer", "service"),
+        "service": ("Service Layer", "service"),
+        "backend": ("Backend Core", "service"),
+        "api": ("API Routes", "api"),
+        "server": ("Server Engine", "service"),
+        "app": ("Application Core", "service"),
+        "src": ("Source Core", "service"),
+        "core": ("Core Domain", "service"),
 
         "auth": ("Authentication", "auth"),
         "authentication": ("Authentication", "auth"),
@@ -618,13 +816,11 @@ def build_component_graph() -> str:
         "database": ("Database Layer", "database"),
         "models": ("Data Models", "database"),
         "model": ("Data Models", "database"),
-        "schema": ("Schema", "database"),
+        "schema": ("Schema Definitions", "database"),
 
-        "routes": ("Routes", "api"),
+        "routes": ("API Routes", "api"),
         "controllers": ("Controllers", "api"),
-        "handlers": ("Handlers", "api"),
-        "views": ("Views", "ui"),
-        "templates": ("Templates", "ui"),
+        "handlers": ("Request Handlers", "api"),
 
         "workers": ("Background Workers", "worker"),
         "jobs": ("Background Jobs", "worker"),
@@ -633,131 +829,133 @@ def build_component_graph() -> str:
 
         "utils": ("Utilities", "util"),
         "helpers": ("Helpers", "util"),
-        "lib": ("Library", "util"),
-        "common": ("Common", "util"),
-        "shared": ("Shared", "util"),
+        "lib": ("Shared Library", "util"),
+        "common": ("Common Modules", "util"),
+        "shared": ("Shared Utilities", "util"),
 
-        "tests": ("Tests", "test"),
-        "test": ("Tests", "test"),
-        "__tests__": ("Tests", "test"),
-        "spec": ("Tests", "test"),
+        "tests": ("Test Suite", "test"),
+        "test": ("Test Suite", "test"),
+        "__tests__": ("Test Suite", "test"),
+        "spec": ("Test Suite", "test"),
 
         "config": ("Configuration", "config"),
-        "scripts": ("Scripts", "config"),
-        "migrations": ("DB Migrations", "database"),
+        "scripts": ("Build Scripts", "config"),
     }
 
-    # Scan top-level directories
+    dir_nodes = {}
     if isinstance(structure, dict) and structure.get("type") == "directory":
-        children = structure.get("children", [])
-        for child in children:
+        for child in structure.get("children", []):
             if child.get("type") != "directory":
                 continue
             dir_name = child.get("name", "").lower()
             if dir_name in _dir_component_map:
                 label, ntype = _dir_component_map[dir_name]
-                add_node(label, ntype, f"/{child['name']}")
+                dnid = add_node(label, ntype, f"Directory /{child['name']}", child.get("path", ""))
+                dir_nodes[dir_name] = dnid
+                for en in entry_nodes:
+                    if ntype in ("ui", "middleware", "service", "api"):
+                        add_edge(en, dnid, "renders/uses")
 
-    # Add detected frameworks as nodes
+    # 4. Extract concrete individual UI Components (e.g. ChatPanel, CookbookView, CookModeView, etc.)
+    comp_dir = repo / "components"
+    if not comp_dir.exists():
+        comp_dir = repo / "src" / "components"
+    if comp_dir.exists() and comp_dir.is_dir():
+        for comp_file in sorted(comp_dir.iterdir()):
+            if comp_file.is_file() and comp_file.suffix in (".tsx", ".jsx", ".vue", ".js", ".ts"):
+                cname = comp_file.stem
+                if cname.lower() in ("index", "types", "vite-env.d"):
+                    continue
+                rel_path = str(comp_file.relative_to(repo)).replace("\\", "/")
+                cid = add_node(cname, "ui", f"UI Component ({rel_path})", rel_path)
+                if "components" in dir_nodes:
+                    add_edge(dir_nodes["components"], cid, "contains")
+                for en in entry_nodes:
+                    add_edge(en, cid, "renders")
+
+    # 5. Extract concrete Service modules (e.g. geminiService.ts, apiService.py, etc.)
+    svc_dir = repo / "services"
+    if not svc_dir.exists():
+        svc_dir = repo / "src" / "services"
+    if svc_dir.exists() and svc_dir.is_dir():
+        for svc_file in sorted(svc_dir.iterdir()):
+            if svc_file.is_file() and svc_file.suffix in (".ts", ".js", ".py", ".go", ".rs"):
+                sname = svc_file.stem
+                if sname.lower() in ("index", "types"):
+                    continue
+                rel_path = str(svc_file.relative_to(repo)).replace("\\", "/")
+                sid = add_node(sname, "service", f"Service Module ({rel_path})", rel_path)
+                if "services" in dir_nodes:
+                    add_edge(dir_nodes["services"], sid, "contains")
+                for en in entry_nodes:
+                    add_edge(en, sid, "invokes")
+                for n in nodes:
+                    if n["type"] == "ui" and n["id"] not in (user_node, *entry_nodes):
+                        add_edge(n["id"], sid, "calls")
+
+    # 6. Detected Frameworks & Bundlers
     for fw in metadata.get("frameworks", []):
         fw_map = {
-            "React": ("React Frontend", "ui"),
-            "Vue.js": ("Vue Frontend", "ui"),
+            "React": ("React Framework", "ui"),
+            "Vite": ("Vite Bundler", "config"),
+            "Vue.js": ("Vue.js Frontend", "ui"),
             "Angular": ("Angular Frontend", "ui"),
-            "Next.js": ("Next.js App", "ui"),
-            "Express": ("Express Server", "service"),
-            "Flask": ("Flask API", "api"),
-            "FastAPI": ("FastAPI", "api"),
-            "Django": ("Django App", "service"),
+            "Next.js": ("Next.js Engine", "ui"),
+            "Express": ("Express API Server", "service"),
+            "Flask": ("Flask REST API", "api"),
+            "FastAPI": ("FastAPI Server", "api"),
+            "Django": ("Django Application", "service"),
+            "TailwindCSS": ("Tailwind CSS", "ui"),
             "Spring": ("Spring Backend", "service"),
-            "Rails": ("Rails App", "service"),
-            "SQLAlchemy": ("ORM / Database", "database"),
-            "Pytest": ("Test Suite", "test"),
+            "Rails": ("Rails Framework", "service"),
+            "SQLAlchemy": ("SQLAlchemy ORM", "database"),
+            "Pytest": ("Pytest Testing Suite", "test"),
         }
         if fw in fw_map:
             label, ntype = fw_map[fw]
-            add_node(label, ntype, fw)
+            fnid = add_node(label, ntype, f"Framework: {fw}")
+            for en in entry_nodes:
+                add_edge(en, fnid, "built_with")
 
-    # Detect external services from dependencies
+    # 7. Detect External AI, DB & Cloud Integrations
     deps_all = []
     for dep_list in metadata.get("dependencies", {}).values():
         deps_all.extend(dep_list)
 
     external_services = {
-        "redis": ("Redis", "cache"),
-        "celery": ("Celery Workers", "worker"),
-        "kafka": ("Kafka", "queue"),
-        "rabbitmq": ("RabbitMQ", "queue"),
-        "elasticsearch": ("Elasticsearch", "search"),
-        "stripe": ("Stripe API", "external"),
-        "twilio": ("Twilio", "external"),
-        "sendgrid": ("SendGrid", "external"),
-        "boto3": ("AWS S3/Services", "external"),
-        "aws-sdk": ("AWS SDK", "external"),
-        "firebase": ("Firebase", "external"),
-        "mongodb": ("MongoDB", "database"),
-        "mongoose": ("MongoDB/Mongoose", "database"),
-        "pg": ("PostgreSQL", "database"),
-        "psycopg2": ("PostgreSQL", "database"),
-        "mysql": ("MySQL", "database"),
-        "sqlite": ("SQLite", "database"),
-        "prisma": ("Prisma ORM", "database"),
-        "sequelize": ("Sequelize ORM", "database"),
-        "jwt": ("JWT Auth", "auth"),
-        "passport": ("Passport Auth", "auth"),
-        "groq": ("Groq LLM", "ai"),
-        "openai": ("OpenAI API", "ai"),
-        "anthropic": ("Claude API", "ai"),
-        "transformers": ("HuggingFace", "ai"),
-        "docker": ("Docker", "infra"),
-        "kubernetes": ("Kubernetes", "infra"),
+        "@google/genai": ("Google Gemini AI", "ai", "Google Gemini Multimodal AI Engine"),
+        "google-genai": ("Google Gemini AI", "ai", "Google Gemini Multimodal AI Engine"),
+        "google-generativeai": ("Google Gemini AI", "ai", "Google Gemini API"),
+        "openai": ("OpenAI API", "ai", "OpenAI LLM Integration"),
+        "anthropic": ("Anthropic Claude", "ai", "Anthropic Claude API"),
+        "langchain": ("LangChain", "ai", "AI Orchestration Framework"),
+        "groq": ("Groq LLM Engine", "ai", "Ultra-fast LPU Inference"),
+        "redis": ("Redis Cache", "cache", "In-Memory Cache / Key-Value Store"),
+        "firebase": ("Firebase Cloud", "external", "Firebase Authentication & Database"),
+        "supabase": ("Supabase", "database", "Postgres & Auth Backend"),
+        "mongodb": ("MongoDB", "database", "NoSQL Document Database"),
+        "mongoose": ("Mongoose ODM", "database", "MongoDB Object Modeling"),
+        "postgres": ("PostgreSQL", "database", "Relational Database"),
+        "pg": ("PostgreSQL Client", "database", "PostgreSQL Database Driver"),
+        "sqlite": ("SQLite Database", "database", "Embedded Database"),
+        "prisma": ("Prisma ORM", "database", "Type-safe Database Client"),
+        "stripe": ("Stripe Payments", "external", "Payment Processing Gateway"),
     }
 
     for dep in deps_all:
         dep_lower = dep.lower().split("[")[0].split(">=")[0].strip()
-        for key, (label, ntype) in external_services.items():
+        for key, (label, ntype, desc) in external_services.items():
             if key in dep_lower:
-                add_node(label, ntype, dep)
+                ext_id = add_node(label, ntype, desc)
+                connected = False
+                for n in nodes:
+                    if n["type"] == "service":
+                        add_edge(n["id"], ext_id, "interacts_with")
+                        connected = True
+                if not connected:
+                    for en in entry_nodes:
+                        add_edge(en, ext_id, "interacts_with")
                 break
-
-    # Build inferred edges between components
-    comp_ids = added
-
-    # Frontend → API
-    ui_nodes = [v for k, v in comp_ids.items()
-                if any(k.startswith(x) for x in ["Frontend", "GUI", "UI", "Client", "React", "Vue", "Angular", "Next.js"])]
-    api_nodes = [v for k, v in comp_ids.items()
-                 if any(k.startswith(x) for x in ["API", "Express", "Flask", "FastAPI", "Django", "Routes", "Controllers"])]
-    svc_nodes = [v for k, v in comp_ids.items()
-                 if any(k.startswith(x) for x in ["Backend", "Server", "Application", "Services", "Source", "Spring", "Rails"])]
-    db_nodes = [v for k, v in comp_ids.items()
-                if any(k.startswith(x) for x in ["Database", "Data Models", "PostgreSQL", "MongoDB", "MySQL", "SQLite", "ORM", "Prisma", "Sequelize"])]
-    auth_nodes = [v for k, v in comp_ids.items()
-                  if any(k.startswith(x) for x in ["Auth", "JWT", "Passport", "Middleware"])]
-    worker_nodes = [v for k, v in comp_ids.items()
-                    if any(k.startswith(x) for x in ["Worker", "Job", "Task", "Queue", "Celery"])]
-    ai_nodes = [v for k, v in comp_ids.items()
-                if any(k.startswith(x) for x in ["Groq", "OpenAI", "Claude", "HuggingFace"])]
-
-    for u in ui_nodes:
-        for a in api_nodes:
-            add_edge(u, a, "calls")
-        for s in svc_nodes[:1]:
-            add_edge(u, s, "calls")
-
-    for a in api_nodes:
-        for s in svc_nodes:
-            add_edge(a, s, "routes_to")
-        for au in auth_nodes:
-            add_edge(a, au, "uses")
-
-    for s in svc_nodes:
-        for d in db_nodes:
-            add_edge(s, d, "reads_writes")
-        for w in worker_nodes:
-            add_edge(s, w, "dispatches")
-        for ai in ai_nodes:
-            add_edge(s, ai, "calls")
 
     # Deduplicate edges
     seen_edges = set()
@@ -785,6 +983,87 @@ def build_component_graph() -> str:
 
     _component_graph_cache[cache_key] = result
     return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def get_component_graph() -> str:
+    """Alias for build_component_graph."""
+    return build_component_graph()
+
+
+@mcp.tool()
+def get_relationship_graph() -> str:
+    """Alias for build_relationship_graph."""
+    return build_relationship_graph()
+
+
+@mcp.tool()
+def get_repository_overview() -> str:
+    """Return repository overview, description, and primary entry points."""
+    doc = json.loads(generate_documentation())
+    return json.dumps(doc.get("overview", {}), indent=2)
+
+
+@mcp.tool()
+def get_dependencies() -> str:
+    """Return repository dependencies (Node, Python, etc.)."""
+    repo = _current_repo()
+    if not repo:
+        return json.dumps({"error": "No repository loaded."})
+    analyzer = _get_analyzer(repo)
+    metadata = analyzer.get_metadata()
+    return json.dumps(metadata.get("dependencies", {}), indent=2)
+
+
+@mcp.tool()
+def detect_tech_stack() -> str:
+    """Detect technologies, primary language, frameworks, and statistics."""
+    repo = _current_repo()
+    if not repo:
+        return json.dumps({"error": "No repository loaded."})
+    analyzer = _get_analyzer(repo)
+    metadata = analyzer.get_metadata()
+    return json.dumps({
+        "primary_language": metadata.get("primary_language", "Unknown"),
+        "languages": metadata.get("languages", {}),
+        "frameworks": metadata.get("frameworks", []),
+        "total_files": metadata.get("total_files", 0),
+        "total_lines": metadata.get("total_lines", 0),
+    }, indent=2)
+
+
+@mcp.tool()
+def get_metadata() -> str:
+    """Return full repository metadata."""
+    repo = _current_repo()
+    if not repo:
+        return json.dumps({"error": "No repository loaded."})
+    analyzer = _get_analyzer(repo)
+    return json.dumps(analyzer.get_metadata(), indent=2)
+
+
+@mcp.tool()
+def analyze_code(file_path: str) -> str:
+    """
+    Analyze a specific file to extract structure, classes, functions, imports, and exports.
+    """
+    repo = _current_repo()
+    if not repo:
+        return json.dumps({"error": "No repository loaded."})
+    analyzer = _get_analyzer(repo)
+    return json.dumps(analyzer.analyze_file(file_path), indent=2)
+
+
+@mcp.tool()
+def lexical_search(
+    query: str,
+    file_pattern: str = "**/*",
+    is_regex: bool = False,
+    case_sensitive: bool = False,
+    top_k: int = 20,
+) -> str:
+    """Lexical search alias for search_code."""
+    return search_code(query, file_pattern, is_regex, case_sensitive)
 
 
 @mcp.tool()

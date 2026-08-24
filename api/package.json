@@ -9,10 +9,12 @@
     "dev": "node --watch server.js"
   },
   "dependencies": {
-    "groq-sdk": "^0.11.0",
+    "@google/genai": "^2.18.0",
     "@modelcontextprotocol/sdk": "^1.15.1",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "express": "^4.21.0"
+    "express": "^4.21.0",
+    "groq-sdk": "^0.11.0",
+    "pdfkit": "^0.19.1"
   }
 }

@@ -41,15 +41,18 @@ FRAMEWORK_SIGNATURES: Dict[str, List[str]] = {
     "Django": ["django.conf", "INSTALLED_APPS", "django.urls", "wsgi.py", "asgi.py"],
     "Flask": ["from flask import", "Flask(__name__", "@app.route", "flask.Flask"],
     "FastAPI": ["from fastapi", "FastAPI()", "@app.get(", "@router.get("],
-    "React": ["from 'react'", "from \"react\"", "useState", "useEffect", "ReactDOM"],
+    "React": ["from 'react'", "from \"react\"", "useState", "useEffect", "ReactDOM", "React."],
     "Vue.js": ["createApp(", "defineComponent(", "from 'vue'"],
     "Angular": ["@Component", "@NgModule", "from '@angular"],
     "Express": ["require('express')", "express()", "app.listen("],
     "Next.js": ["getServerSideProps", "getStaticProps", "from 'next'"],
+    "Vite": ["from 'vite'", "createVite", "vite.config", "@vitejs"],
+    "TailwindCSS": ["tailwindcss", "tailwind.config"],
     "Spring": ["@Controller", "@Service", "@RestController", "springframework"],
     "Rails": ["ActionController", "ApplicationRecord", "has_many", "belongs_to"],
     "Pytest": ["import pytest", "def test_", "@pytest.fixture"],
     "SQLAlchemy": ["from sqlalchemy", "declarative_base", "Column("],
+    "Google Gemini GenAI": ["@google/genai", "GoogleGenAI", "gemini-2", "gemini-1.5"],
 }
 
 MAX_FILE_SIZE = 500 * 1024   # 500 KB — skip larger files
@@ -285,10 +288,35 @@ class CodeAnalyzer:
                 source = js_path.read_text(encoding="utf-8", errors="replace")
 
                 # ESM imports
-                for m in re.finditer(r"""from\s+['"]([^'"]+)['"]""", source):
+                for m in re.finditer(r"""(?:import|export)\s+(?:(?:[\w*\s{},]+)\s+from\s+)?['"]([^'"]+)['"]""", source):
                     mod = m.group(1)
                     if mod.startswith("."):
-                        continue   # skip local relative imports for brevity
+                        # Resolve local relative file import
+                        try:
+                            target_dir = js_path.parent
+                            target_base = target_dir / mod
+                            resolved_rel = None
+                            for test_suffix in ("", ".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.tsx", "/index.js"):
+                                test_path = Path(str(target_base) + test_suffix).resolve()
+                                if test_path.exists() and test_path.is_file():
+                                    try:
+                                        rel_p = str(test_path.relative_to(self.repo_path.resolve()))
+                                        resolved_rel = rel_p
+                                        break
+                                    except ValueError:
+                                        pass
+                            if resolved_rel:
+                                if resolved_rel not in file_id:
+                                    target_nid = new_id("file")
+                                    file_id[resolved_rel] = target_nid
+                                    nodes[target_nid] = {
+                                        "id": target_nid, "label": Path(resolved_rel).name,
+                                        "type": "file", "path": resolved_rel, "language": "javascript",
+                                    }
+                                add_edge(nid, file_id[resolved_rel], "imports")
+                                continue
+                        except Exception:
+                            pass
                     root_mod = mod.lstrip("@").split("/")[0]
                     add_edge(nid, ensure_module(root_mod), "imports")
 
@@ -440,43 +468,172 @@ class CodeAnalyzer:
             }
         return None
 
+    def analyze_file(self, file_path: str) -> Dict[str, Any]:
+        """Analyze a specific file to extract structure, classes, functions, imports, and exports."""
+        path = (self.repo_path / file_path).resolve()
+        if not path.exists() or not str(path).startswith(str(self.repo_path)):
+            return {"error": "File not found or access denied."}
+
+        ext = path.suffix.lower()
+        lang = LANGUAGE_EXTENSIONS.get(ext, "Text")
+        try:
+            source = path.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            return {"error": f"Could not read file: {e}"}
+
+        lines = source.splitlines()
+        result: Dict[str, Any] = {
+            "file_path": str(path.relative_to(self.repo_path)),
+            "language": lang,
+            "total_lines": len(lines),
+            "size_bytes": path.stat().st_size,
+            "classes": [],
+            "functions": [],
+            "imports": [],
+            "exports": [],
+            "dependencies": [],
+        }
+
+        if ext == ".py":
+            try:
+                tree = ast.parse(source)
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.ClassDef):
+                        result["classes"].append({
+                            "name": node.name,
+                            "line": node.lineno,
+                            "docstring": ast.get_docstring(node),
+                        })
+                    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        result["functions"].append({
+                            "name": node.name,
+                            "line": node.lineno,
+                            "docstring": ast.get_docstring(node),
+                        })
+                    elif isinstance(node, ast.Import):
+                        for alias in node.names:
+                            result["imports"].append({"module": alias.name, "line": node.lineno})
+                    elif isinstance(node, ast.ImportFrom):
+                        if node.module:
+                            result["imports"].append({"module": node.module, "line": node.lineno})
+            except Exception:
+                pass
+        elif ext in (".js", ".jsx", ".ts", ".tsx"):
+            # Functions
+            for m in re.finditer(r"(?:export\s+)?(?:async\s+)?function\s+([a-zA-Z0-9_$]+)", source):
+                result["functions"].append({
+                    "name": m.group(1),
+                    "line": source[:m.start()].count("\n") + 1
+                })
+            for m in re.finditer(r"(?:export\s+)?const\s+([a-zA-Z0-9_$]+)\s*=\s*(?:async\s*)?\([^)]*\)\s*=>", source):
+                result["functions"].append({
+                    "name": m.group(1),
+                    "line": source[:m.start()].count("\n") + 1
+                })
+            # Classes / Interfaces / Types
+            for m in re.finditer(r"(?:export\s+)?(?:class|interface|type)\s+([a-zA-Z0-9_$]+)", source):
+                result["classes"].append({
+                    "name": m.group(1),
+                    "line": source[:m.start()].count("\n") + 1
+                })
+            # Imports
+            for m in re.finditer(r"""import\s+(?:.*?from\s+)?['"]([^'"]+)['"]""", source):
+                result["imports"].append({
+                    "module": m.group(1),
+                    "line": source[:m.start()].count("\n") + 1
+                })
+            # Exports
+            for m in re.finditer(r"export\s+(?:default\s+)?(?:function|class|const|let|var|type|interface)?\s*([a-zA-Z0-9_$]+)?", source):
+                if m.group(1):
+                    result["exports"].append({"name": m.group(1), "line": source[:m.start()].count("\n") + 1})
+
+        return result
+
     def _detect_frameworks(self) -> List[str]:
-        found = []
+        found = set()
+        deps = self._parse_dependencies()
+
+        # Check package.json dependencies
+        node_deps = set(deps.get("node", []) + deps.get("node_dev", []))
+        if any("react" in d for d in node_deps):
+            found.add("React")
+        if any("vite" in d for d in node_deps):
+            found.add("Vite")
+        if any("next" in d for d in node_deps):
+            found.add("Next.js")
+        if any("vue" in d for d in node_deps):
+            found.add("Vue.js")
+        if any("angular" in d for d in node_deps):
+            found.add("Angular")
+        if any("express" in d for d in node_deps):
+            found.add("Express")
+        if any("tailwind" in d for d in node_deps):
+            found.add("TailwindCSS")
+        if any("google/genai" in d or "google-generativeai" in d for d in node_deps):
+            found.add("Google Gemini GenAI")
+
+        # Check python dependencies
+        py_deps = [d.lower() for d in deps.get("python", [])]
+        if any("django" in d for d in py_deps):
+            found.add("Django")
+        if any("flask" in d for d in py_deps):
+            found.add("Flask")
+        if any("fastapi" in d for d in py_deps):
+            found.add("FastAPI")
+        if any("google-generativeai" in d or "google-genai" in d for d in py_deps):
+            found.add("Google Gemini GenAI")
+        if any("openai" in d for d in py_deps):
+            found.add("OpenAI")
+        if any("anthropic" in d for d in py_deps):
+            found.add("Anthropic Claude")
+        if any("sqlalchemy" in d for d in py_deps):
+            found.add("SQLAlchemy")
+        if any("pytest" in d for d in py_deps):
+            found.add("Pytest")
+
+        # Content signature scanning across code files
         sample_files: List[Path] = []
-        for ext in (".py", ".js", ".ts", ".html"):
-            sample_files.extend(list(self._iter_files(ext=ext))[:30])
+        for ext in (".py", ".js", ".ts", ".tsx", ".jsx", ".html"):
+            sample_files.extend(list(self._iter_files(ext=ext))[:40])
 
         content_blob = ""
-        for f in sample_files[:80]:
+        for f in sample_files[:100]:
             try:
-                content_blob += f.read_text(encoding="utf-8", errors="replace")[:1500]
+                content_blob += f.read_text(encoding="utf-8", errors="replace")[:2000]
             except Exception:
                 pass
 
         for fw, sigs in FRAMEWORK_SIGNATURES.items():
             if any(sig in content_blob for sig in sigs):
-                found.append(fw)
+                found.add(fw)
 
-        return found
+        return sorted(found)
 
     def _detect_entry_points(self) -> List[str]:
         candidates = [
-            "main.py", "app.py", "index.py", "run.py", "manage.py",
-            "server.py", "wsgi.py", "asgi.py",
+            "App.tsx", "main.tsx", "index.tsx", "App.jsx", "main.jsx", "index.jsx", "App.js",
+            "src/App.tsx", "src/main.tsx", "src/index.tsx", "src/App.jsx", "src/main.jsx", "src/index.jsx",
+            "main.py", "app.py", "index.py", "run.py", "manage.py", "server.py", "wsgi.py", "asgi.py",
+            "src/main.py", "src/app.py", "src/server.py",
             "index.js", "main.js", "app.js", "server.js",
-            "index.ts", "main.ts",
-            "main.go", "main.rs", "Main.java",
+            "index.ts", "main.ts", "server.ts",
+            "main.go", "main.rs", "Main.java", "index.html",
         ]
-        return [c for c in candidates if (self.repo_path / c).exists()]
+        found = []
+        for c in candidates:
+            if (self.repo_path / c).exists():
+                found.append(c)
+        return found
 
     def _detect_key_files(self) -> List[str]:
         candidates = [
             "requirements.txt", "package.json", "Cargo.toml",
             "go.mod", "pom.xml", "build.gradle",
             "setup.py", "pyproject.toml", "setup.cfg",
-            "Dockerfile", "docker-compose.yml",
+            "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
             ".github", "Makefile", "tox.ini", "pytest.ini",
-            ".eslintrc.json", "tsconfig.json",
+            ".eslintrc.json", "tsconfig.json", "vite.config.ts", "vite.config.js",
+            ".env.example", ".env.local.example",
         ]
         return [c for c in candidates if (self.repo_path / c).exists()]
 

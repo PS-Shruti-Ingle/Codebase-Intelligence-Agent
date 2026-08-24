@@ -112,8 +112,9 @@ html, body {
 .workspace {
   display: grid;
   grid-template-rows: 54px 1fr 28px;
-  grid-template-columns: 250px 1fr 390px;
+  grid-template-columns: 250px minmax(320px, 1fr) var(--right-width, 390px);
   height: 100vh;
+  position: relative;
 }
 
 .topbar    { grid-column: 1 / -1; grid-row: 1; }
@@ -284,6 +285,17 @@ html, body {
 }
 .panel-right  { border-right: none; border-left: 1px solid var(--border); }
 .panel-center { border-right: 1px solid var(--border); }
+.panel-divider {
+  position: fixed;
+  top: 54px;
+  right: calc(var(--right-width, 390px) - 3px);
+  bottom: 28px;
+  width: 6px;
+  cursor: col-resize;
+  z-index: 200;
+  background: transparent;
+}
+.panel-divider:hover, .panel-divider.dragging { background: var(--accent-from); box-shadow: 0 0 10px var(--accent-from); }
 
 .panel-section-title {
   font-size: 10px;
@@ -918,6 +930,13 @@ html, body {
   font-size: 13px;
   line-height: 1.65;
   color: var(--text-primary);
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.readme-content img {
+  max-width: 100%;
+  height: auto;
+  border-radius: var(--radius-sm);
 }
 .readme-content h1, .readme-content h2, .readme-content h3 { color: var(--text-accent); margin: 10px 0 5px; }
 .readme-content p { margin: 5px 0; }
@@ -1013,6 +1032,7 @@ html, body {
 @keyframes spin { to { transform: rotate(360deg); } }
 #loading-msg { color: var(--text-muted); font-size: 13px; max-width: 300px; text-align: center; }
 .loading-sub { font-size: 11px; color: var(--text-dim); }
+#cancel-analysis-btn { margin-top: 4px; }
 
 /* ============================================================
    UTILITY
@@ -1134,6 +1154,8 @@ html, body {
     </div>
   </main>
 
+  <div class="panel-divider" id="panel-divider" role="separator" aria-label="Resize right panel" aria-orientation="vertical"></div>
+
   <!-- ══════════════════════════════════════
        RIGHT — AI + ARCHITECTURE + DOCS
   ══════════════════════════════════════════ -->
@@ -1220,6 +1242,9 @@ html, body {
                   onclick="generateDocs()" style="display:none">
             Generate Documentation
           </button>
+          <button class="btn btn-primary docs-generate-btn" id="docs-pdf-btn" onclick="openDocumentationPdf()" style="display:none">
+            Open One-Page PDF
+          </button>
         </div>
         <div id="docs-main" style="display:none"></div>
       </div>
@@ -1258,6 +1283,7 @@ html, body {
   <div class="spinner" aria-hidden="true"></div>
   <div id="loading-msg">Analyzing repository…</div>
   <div class="loading-sub" id="loading-sub"></div>
+  <button class="btn btn-ghost" id="cancel-analysis-btn" onclick="cancelAnalysis()">Cancel Analysis</button>
 </div>
 
 <!-- Node tooltip -->
@@ -1272,15 +1298,143 @@ html, body {
 // ──────────────────────────────────────────────────────────────────────────────
 const API = '';   // same-origin
 
-let _repoLoaded   = false;
-let _fullTree     = null;
-let _graphZoom    = null;
-let _graphSim     = null;
-let _graphSvg     = null;
-let _currentGraphType = 'component'; // 'component' | 'file'
-let _graphDataCache   = {};          // type -> data
-let _currentBranch = '';
-let _suggestedQs  = [];
+let _repoLoaded        = false;
+let _currentRepoUrl    = '';
+let _currentCanonicalId = '';
+let _currentWorkspaceId = '';
+let _workspaceVersion  = 0;
+let _activeFile        = null;
+let _fullTree          = null;
+let _graphZoom         = null;
+let _graphSim          = null;
+let _graphSvg          = null;
+let _currentGraphType  = 'component'; // 'component' | 'file'
+let _graphDataCache    = {};          // type -> data
+let _currentBranch     = '';
+let _suggestedQs       = [];
+
+function canonicalRepoId(url) {
+  if (!url || typeof url !== 'string') return '';
+  let u = url.trim();
+  u = u.replace(/^(git\+https?:\/\/|git\+ssh:\/\/|git@)/i, 'https://');
+  u = u.replace(/^https?:\/\/github\.com:/i, 'https://github.com/');
+  u = u.replace(/https?:\/\/[^@]+@github\.com\//i, 'https://github.com/');
+  u = u.replace(/\/+$/, '');
+  if (u.endsWith('.git')) u = u.slice(0, -4);
+  const match = u.match(/github\.com\/([^/]+)\/([^/]+)/i);
+  if (match) {
+    return `${match[1].toLowerCase().trim()}/${match[2].toLowerCase().trim()}`;
+  }
+  const parts = u.split('/').filter(Boolean);
+  if (parts.length >= 2) {
+    return `${parts[parts.length - 2].toLowerCase().trim()}/${parts[parts.length - 1].toLowerCase().trim()}`;
+  }
+  return u.toLowerCase().trim();
+}
+
+/**
+ * Completely resets all workspace state, chat, file tree, viewer, graphs, docs, and caches.
+ */
+function resetWorkspace(newCanonicalId = '', options = {}) {
+  _workspaceVersion++;
+  const thisVersion = _workspaceVersion;
+
+  // 1. Reset chat messages with clean greeting for the new workspace
+  const chatMsgs = el('chat-messages');
+  if (chatMsgs) {
+    chatMsgs.innerHTML = '';
+    const welcomeWrap = document.createElement('div');
+    welcomeWrap.className = 'msg ai';
+    welcomeWrap.innerHTML = `
+      <div class="msg-avatar" aria-hidden="true">🧠</div>
+      <div class="msg-bubble">
+        <strong class="gradient-text">${newCanonicalId ? `Fresh Workspace Initialized (${escHtml(newCanonicalId)})` : 'Ready to analyze your codebase.'}</strong>
+        <p>${newCanonicalId ? `Workspace switched to <code>${escHtml(newCanonicalId)}</code>. All previous conversation history, indexed data, and context have been completely reset.` : 'Clone any public GitHub repository to get started.'}</p>
+        <p>Every answer is grounded in real code with verified file and line citations.</p>
+      </div>`;
+    chatMsgs.appendChild(welcomeWrap);
+  }
+
+  // Clear chat input & quick prompts
+  if (el('chat-input')) el('chat-input').value = '';
+  if (el('suggestions-list')) el('suggestions-list').innerHTML = '';
+  if (el('suggestions-wrap')) el('suggestions-wrap').style.display = 'none';
+  _suggestedQs = [];
+
+  // 2. Reset file explorer & code viewer
+  _fullTree = null;
+  _activeFile = null;
+  if (el('file-tree')) el('file-tree').innerHTML = '<div class="tree-empty">Loading file structure…</div>';
+  if (el('code-body')) el('code-body').innerHTML = '<div class="code-empty"><span style="font-size:32px;opacity:.2">📄</span><span>Select a file to inspect code</span></div>';
+  if (el('code-filename')) el('code-filename').textContent = 'No file selected';
+  if (el('code-meta')) el('code-meta').textContent = '';
+  if (el('code-raw-btn')) el('code-raw-btn').style.display = 'none';
+
+  // 3. Reset architecture & component graphs
+  _graphDataCache = {};
+  if (typeof d3 !== 'undefined') {
+    const svg = d3.select('#graph-svg');
+    svg.selectAll('*').remove();
+  }
+  if (el('graph-empty')) el('graph-empty').style.display = '';
+  if (el('graph-type-toggle')) el('graph-type-toggle').style.display = 'none';
+  if (el('graph-legend')) el('graph-legend').style.display = 'none';
+
+  // 4. Reset documentation
+  if (el('docs-main')) {
+    el('docs-main').innerHTML = '';
+    el('docs-main').style.display = 'none';
+  }
+  if (el('docs-generate-btn')) el('docs-generate-btn').style.display = 'none';
+  if (el('docs-pdf-btn')) el('docs-pdf-btn').style.display = 'none';
+
+  // 5. Reset branches & status bar
+  if (el('branches-list')) el('branches-list').innerHTML = '';
+  if (el('branches-section')) el('branches-section').style.display = 'none';
+  _currentBranch = '';
+  if (el('status-branch')) el('status-branch').textContent = '–';
+  if (el('status-commit')) el('status-commit').textContent = '–';
+  if (el('status-files')) el('status-files').textContent = '–';
+  if (el('status-sync')) el('status-sync').textContent = '';
+  if (el('analysis-status')) el('analysis-status').textContent = newCanonicalId ? 'Starting fresh workspace…' : 'Idle';
+
+  // 6. Reset search
+  if (el('quick-search')) el('quick-search').value = '';
+  if (el('search-results')) el('search-results').innerHTML = '';
+
+  // 7. Clear repository-scoped localStorage keys
+  try {
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const key = localStorage.key(i);
+      if (key && (key.startsWith('repo_') || key.startsWith('ws_') || key.startsWith('chat_'))) {
+        localStorage.removeItem(key);
+      }
+    }
+  } catch (_) {}
+
+  return thisVersion;
+}
+
+const divider = document.getElementById('panel-divider');
+let resizing = false;
+divider.addEventListener('pointerdown', event => {
+  resizing = true;
+  divider.classList.add('dragging');
+  divider.setPointerCapture(event.pointerId);
+  document.body.style.cursor = 'col-resize';
+});
+divider.addEventListener('pointermove', event => {
+  if (!resizing) return;
+  const width = Math.max(300, Math.min(window.innerWidth - 570, window.innerWidth - event.clientX));
+  document.documentElement.style.setProperty('--right-width', `${width}px`);
+  if (_graphDataCache[_currentGraphType]) renderGraph(_graphDataCache[_currentGraphType].workflow || _graphDataCache[_currentGraphType], _currentGraphType);
+});
+divider.addEventListener('pointerup', event => {
+  resizing = false;
+  divider.classList.remove('dragging');
+  divider.releasePointerCapture(event.pointerId);
+  document.body.style.cursor = '';
+});
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Boot
@@ -1289,23 +1443,33 @@ let _suggestedQs  = [];
   // Check if a repo is already loaded (server restart persistence)
   try {
     const status = await get('/api/status');
-    if (status && !status.error && status.branch) {
+    if (status && !status.error && status.branch && status.repo_url) {
+      _currentRepoUrl = status.repo_url;
+      _currentCanonicalId = canonicalRepoId(status.repo_url);
       _currentBranch = status.branch;
+      if (el('repo-url') && !el('repo-url').value) {
+        el('repo-url').value = status.repo_url;
+      }
       updateStatusBar(status);
-      // Try to reload tree silently
       try {
         await loadStructure();
         await loadBranches();
         await loadMetadata();
         _repoLoaded = true;
         el('docs-generate-btn').style.display = '';
-      } catch (_) {}
+        el('analysis-status').textContent = `✓ Workspace ready: ${_currentCanonicalId}`;
+        // Automatically load architecture graph and generate documentation on workspace load
+        await loadComponentGraph();
+        await generateDocs(true);
+      } catch (e) {
+        console.error('[Boot repo load error]', e);
+      }
     }
   } catch (_) {}
 })();
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Clone repository
+// Clone / Switch repository
 // ──────────────────────────────────────────────────────────────────────────────
 async function cloneRepo() {
   const url = el('repo-url').value.trim();
@@ -1318,17 +1482,38 @@ async function cloneRepo() {
     return;
   }
 
-  showLoading('Cloning repository…', 'This may take a moment for large repositories.');
+  const targetCanonical = canonicalRepoId(url);
+  const isSameRepo = (_repoLoaded && _currentCanonicalId && _currentCanonicalId === targetCanonical);
+
+  if (isSameRepo) {
+    showNotice(`Repository '${targetCanonical}' is active. Refreshing architecture graph & documentation…`, 'info');
+    await loadComponentGraph();
+    await generateDocs(true);
+    return;
+  }
+
+  // Atomically reset workspace for new repository
+  const version = resetWorkspace(targetCanonical);
+  showLoading('Switching repository…', 'Creating fresh workspace and downloading repository.');
   el('clone-btn').disabled = true;
 
   try {
     const res = await post('/api/clone', { url });
+
+    // Race condition guard: ignore response if user triggered another switch in the meantime
+    if (_workspaceVersion !== version) {
+      return;
+    }
 
     if (res.status === 'error') {
       hideLoading();
       showNotice('Clone failed: ' + res.message, 'warn');
       return;
     }
+
+    _currentRepoUrl = url;
+    _currentCanonicalId = targetCanonical;
+    _currentWorkspaceId = res.workspace_id || `ws_${targetCanonical}`;
 
     // Update branch display
     if (res.resolved_branch) {
@@ -1337,39 +1522,49 @@ async function cloneRepo() {
 
     showLoading('Building file tree…', 'Scanning repository structure.');
     await loadStructure();
+    if (_workspaceVersion !== version) return;
 
     showLoading('Discovering branches…', '');
     await loadBranches(res.branches);
+    if (_workspaceVersion !== version) return;
 
     showLoading('Detecting languages & frameworks…', '');
     await loadMetadata();
+    if (_workspaceVersion !== version) return;
 
     showLoading('Generating architecture graph…', 'Analyzing components and dependencies.');
     await loadComponentGraph();
+    if (_workspaceVersion !== version) return;
 
     showLoading('Generating project documentation…', 'Analyzing codebase to build project understanding.');
-    await generateDocs(true);  // silent = true (no tab switch)
+    await generateDocs(true);  // silent = true
+    if (_workspaceVersion !== version) return;
 
     // Update status bar
     try {
       const status = await get('/api/status');
-      updateStatusBar(status);
+      if (_workspaceVersion === version) {
+        updateStatusBar(status);
+      }
     } catch (_) {}
 
     _repoLoaded = true;
-    el('analysis-status').textContent = `✓ Analysis complete`;
+    el('analysis-status').textContent = `✓ Workspace ready: ${targetCanonical}`;
 
-    // Show suggestions tab prompt
-    if (res.status === 'already_exists') {
-      showNotice('Repository already cloned — using existing local copy.', 'info');
+    if (res.is_switch) {
+      showNotice(`Successfully switched workspace to ${targetCanonical}.`, 'success');
     }
 
   } catch (err) {
-    showNotice('Repository could not be analyzed. Check the URL and try again.', 'warn');
-    console.error('[Clone]', err);
+    if (_workspaceVersion === version) {
+      showNotice('Repository could not be analyzed. Check the URL and try again.', 'warn');
+      console.error('[Clone]', err);
+    }
   } finally {
-    hideLoading();
-    el('clone-btn').disabled = false;
+    if (_workspaceVersion === version) {
+      hideLoading();
+      el('clone-btn').disabled = false;
+    }
   }
 }
 
@@ -1734,9 +1929,13 @@ async function loadComponentGraph() {
         el('graph-type-toggle').style.display = '';
         el('graph-legend').style.display = '';
         renderGraph(data, 'component');
+      } else {
+        el('graph-empty').style.display = 'flex';
       }
     }
-  } catch (_) {}
+  } catch (err) {
+    console.error('[Load component graph failed]', err);
+  }
 }
 
 async function loadFileGraph() {
@@ -1768,18 +1967,23 @@ function switchGraphType(type, btnEl) {
 }
 
 function renderGraph(data, graphType = 'component') {
+  if (_graphSim) {
+    _graphSim.stop();
+    _graphSim = null;
+  }
+
   const container = el('graph-container');
   const svgEl     = el('graph-svg');
   svgEl.innerHTML = '';
 
-  if (!data.nodes?.length) {
+  if (!data || !data.nodes?.length) {
     el('graph-empty').style.display = 'flex';
     return;
   }
   el('graph-empty').style.display = 'none';
 
-  const W = container.clientWidth;
-  const H = container.clientHeight;
+  const W = container.clientWidth || 600;
+  const H = container.clientHeight || 500;
 
   const svg = d3.select('#graph-svg').attr('width', W).attr('height', H);
 
@@ -1788,13 +1992,13 @@ function renderGraph(data, graphType = 'component') {
   defs.append('marker')
     .attr('id', 'arrow')
     .attr('viewBox', '0 -4 8 8')
-    .attr('refX', 18)
-    .attr('markerWidth', 5)
-    .attr('markerHeight', 5)
+    .attr('refX', graphType === 'component' ? 22 : 16)
+    .attr('markerWidth', 6)
+    .attr('markerHeight', 6)
     .attr('orient', 'auto')
     .append('path')
     .attr('d', 'M0,-4L8,0L0,4')
-    .attr('fill', 'rgba(255,255,255,0.2)');
+    .attr('fill', 'rgba(148,163,184,0.6)');
 
   const g = svg.append('g');
 
@@ -1804,11 +2008,34 @@ function renderGraph(data, graphType = 'component') {
   svg.call(zoom);
   _graphZoom = { zoom, svg };
 
-  // Limit for performance
+  // Set initial zoom centered
+  const initialScale = graphType === 'component' ? 0.85 : 0.7;
+  svg.call(zoom.transform, d3.zoomIdentity.translate(W / 2, H / 2).scale(initialScale).translate(-W / 2, -H / 2));
+
+  // Limit and clone nodes & edges to avoid D3 in-place mutation corruption
   const MAX_NODES = graphType === 'component' ? 60 : 150;
-  const nodes = data.nodes.slice(0, MAX_NODES);
-  const nodeIds = new Set(nodes.map(n => n.id));
-  const edges = data.edges
+  const rawNodes = (data.nodes || []).slice(0, MAX_NODES);
+  const nodeIds = new Set(rawNodes.map(n => n.id));
+
+  const nodes = rawNodes.map(n => ({
+    id: n.id,
+    label: n.label,
+    type: n.type,
+    description: n.description,
+    path: n.path,
+    line: n.line,
+  }));
+
+  const getSourceId = e => (typeof e.source === 'object' && e.source !== null) ? e.source.id : e.source;
+  const getTargetId = e => (typeof e.target === 'object' && e.target !== null) ? e.target.id : e.target;
+
+  const edges = (data.edges || [])
+    .map(e => ({
+      source: getSourceId(e),
+      target: getTargetId(e),
+      label: e.label,
+      type: e.type,
+    }))
     .filter(e => nodeIds.has(e.source) && nodeIds.has(e.target))
     .slice(0, 300);
 
@@ -1817,8 +2044,8 @@ function renderGraph(data, graphType = 'component') {
     .selectAll('line')
     .data(edges)
     .join('line')
-    .attr('stroke', 'rgba(255,255,255,0.15)')
-    .attr('stroke-width', 1.5)
+    .attr('stroke', 'rgba(148,163,184,0.35)')
+    .attr('stroke-width', graphType === 'component' ? 1.5 : 1)
     .attr('marker-end', 'url(#arrow)');
 
   // Nodes
@@ -1854,7 +2081,6 @@ function renderGraph(data, graphType = 'component') {
     .attr('filter', d => graphType === 'component' ? 'drop-shadow(0 0 4px ' + nodeColor(d) + '40)' : 'none');
 
   if (graphType === 'component') {
-    // Larger labels for component graph
     node.append('text')
       .attr('x', 0)
       .attr('y', 26)
@@ -1868,7 +2094,7 @@ function renderGraph(data, graphType = 'component') {
       .attr('x', 11)
       .attr('y', 4)
       .attr('font-size', d => d.type === 'file' ? '10px' : '9px')
-      .attr('fill', '#94a3b8')
+      .attr('fill', '#cbd5e1')
       .attr('font-family', "'JetBrains Mono', monospace")
       .text(d => d.label.length > 18 ? d.label.slice(0, 16) + '…' : d.label);
   }
@@ -1892,14 +2118,14 @@ function renderGraph(data, graphType = 'component') {
     .on('mouseleave', () => { tooltip.style.opacity = '0'; });
 
   // Force simulation
-  const linkDistance = graphType === 'component' ? 100 : 60;
-  const chargeStr    = graphType === 'component' ? -300 : -180;
+  const linkDistance = graphType === 'component' ? 110 : 80;
+  const chargeStr    = graphType === 'component' ? -350 : -200;
 
   const sim = d3.forceSimulation(nodes)
-    .force('link', d3.forceLink(edges).id(d => d.id).distance(linkDistance).strength(0.5))
+    .force('link', d3.forceLink(edges).id(d => d.id).distance(linkDistance).strength(0.6))
     .force('charge', d3.forceManyBody().strength(chargeStr))
     .force('center', d3.forceCenter(W / 2, H / 2))
-    .force('collision', d3.forceCollide().radius(d => nodeRadius(d) + 20))
+    .force('collision', d3.forceCollide().radius(d => nodeRadius(d) + 15))
     .on('tick', () => {
       link
         .attr('x1', d => d.source.x)
@@ -1920,10 +2146,12 @@ function graphZoom(factor) {
 
 function graphReset() {
   if (!_graphSvg) return;
-  const W = el('graph-container').clientWidth;
-  const H = el('graph-container').clientHeight;
+  const container = el('graph-container');
+  const W = container.clientWidth || 600;
+  const H = container.clientHeight || 500;
+  const scale = _currentGraphType === 'component' ? 0.85 : 0.7;
   _graphSvg.svg.transition().duration(400)
-    .call(_graphSvg.zoom.transform, d3.zoomIdentity.translate(W / 2, H / 2).scale(0.7));
+    .call(_graphSvg.zoom.transform, d3.zoomIdentity.translate(W / 2, H / 2).scale(scale).translate(-W / 2, -H / 2));
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1945,6 +2173,7 @@ async function generateDocs(silent = false) {
     }
 
     renderDocs(doc);
+    el('docs-pdf-btn').style.display = '';
     _suggestedQs = doc.suggested_questions || [];
     renderSuggestions(_suggestedQs);
 
@@ -2073,23 +2302,28 @@ function renderDocs(doc) {
     main.appendChild(readmeEl);
   }
 
-  // Suggested questions
-  if ((doc.suggested_questions || []).length) {
-    let qHtml = '';
-    doc.suggested_questions.forEach(q => {
-      qHtml += `<button class="suggested-q" onclick="askSuggestedQuestion('${escAttr(q)}')">
-        <span class="q-icon">💬</span>${escHtml(q)}
-      </button>`;
-    });
-    main.innerHTML += `
-      <div class="doc-section">
-        <h3>💡 Suggested Questions</h3>
-        ${qHtml}
-      </div>
-    `;
-  }
-
   el('docs-generate-btn').style.display = 'none';
+}
+
+function openDocumentationPdf() {
+  window.open(`${API}/api/documentation.pdf`, '_blank', 'noopener');
+}
+
+async function cancelAnalysis() {
+  try {
+    await post('/api/cancel', {});
+    _repoLoaded = false;
+    _currentRepoUrl = '';
+    _currentCanonicalId = '';
+    _currentWorkspaceId = '';
+    resetWorkspace('');
+    el('analysis-status').textContent = 'Workspace reset / Analysis cancelled';
+  } catch (err) {
+    showNotice(err.message || 'Analysis could not be cancelled.', 'warn');
+  } finally {
+    hideLoading();
+    el('clone-btn').disabled = false;
+  }
 }
 
 function openFileByName(name) {
@@ -2414,12 +2648,24 @@ function switchTab(tabId, btnEl) {
     btnEl.setAttribute('aria-selected', 'true');
   }
 
-  // Lazy-load file graph when tab first opened
-  if (tabId === 'graph' && _repoLoaded && !_graphDataCache['component']) {
-    loadComponentGraph();
+  // Lazy-load file graph or docs when tab is opened
+  if (tabId === 'graph' && _repoLoaded) {
+    setTimeout(() => {
+      if (!_graphDataCache[_currentGraphType] || !_graphDataCache[_currentGraphType]?.nodes?.length) {
+        if (_currentGraphType === 'component') {
+          loadComponentGraph();
+        } else {
+          loadFileGraph();
+        }
+      } else {
+        renderGraph(_graphDataCache[_currentGraphType], _currentGraphType);
+      }
+    }, 10);
   }
-  if (tabId === 'docs' && _repoLoaded && el('docs-main').style.display === 'none') {
-    el('docs-generate-btn').style.display = '';
+  if (tabId === 'docs' && _repoLoaded) {
+    if (el('docs-main') && el('docs-main').style.display === 'none') {
+      generateDocs(false);
+    }
   }
 }
 
