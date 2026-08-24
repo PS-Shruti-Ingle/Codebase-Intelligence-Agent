@@ -3,7 +3,7 @@
 > **An MCP-powered AI workspace for understanding real software repositories — with targeted retrieval, repository-grounded reasoning, and efficient LLM context usage.**
 
 [![MCP](https://img.shields.io/badge/MCP-Powered-green)](#-mcp-is-the-hero)
-[![LLM](https://img.shields.io/badge/LLM-Groq%20Llama-purple)](#-architecture)
+[![LLM](https://img.shields.io/badge/LLM-Gemini-purple)](#-architecture)
 [![Repository](https://img.shields.io/badge/Repository-Aware-blue)](#-architecture)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-yellow)](#-getting-started)
 [![Node.js](https://img.shields.io/badge/Node.js-18%2B-brightgreen)](#-getting-started)
@@ -216,7 +216,7 @@ Focused LLM context
                 │ MCP Client                  │
                 ▼                             ▼
 ┌───────────────────────────────┐      ┌──────────────────────┐
-│       PYTHON MCP SERVER       │      │    GROQ LLAMA        │
+│       PYTHON MCP SERVER       │      │       GEMINI         │
 │                               │      │                      │
 │ Tools • Resources • Prompts   │◄────►│ ReAct Q&A +          │
 │ Repository Intelligence       │      │ One-Shot Reflection  │
@@ -238,7 +238,7 @@ Focused LLM context
 | **API**        | Node.js + Express    | Application orchestration             |
 | **MCP Client** | Node.js              | Connects application to MCP server    |
 | **MCP Server** | Python               | Repository intelligence               |
-| **LLM**        | Groq Llama           | Reasoning and response generation     |
+| **LLM**        | Gemini               | Reasoning and response generation     |
 | **Retrieval**  | Regex + AST + TF-IDF | Multi-stage code retrieval            |
 | **Graph**      | D3.js                | Repository relationship visualization |
 | **Repository** | Git / GitHub         | Source code                           |
@@ -440,7 +440,7 @@ Key metrics include:
 | Python       | 3.10+              |
 | Node.js      | 18+                |
 | Git          | Any recent version |
-| Groq API Key | Required           |
+| Gemini API Key | Required           |
 
 ---
 
@@ -488,7 +488,7 @@ cp .env.example .env
 Set:
 
 ```env
-GROQ_API_KEY=gsk-...
+GEMINI_API_KEY=...
 ```
 
 ### Start
